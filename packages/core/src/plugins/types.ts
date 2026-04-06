@@ -660,6 +660,22 @@ export interface ContentDeleteEvent {
 }
 
 /**
+ * Content publish hook event (before publish — content not yet published)
+ */
+export interface ContentPublishEvent {
+	id: string;
+	collection: string;
+}
+
+/**
+ * Content after publish hook event (content is now published)
+ */
+export interface ContentAfterPublishEvent {
+	content: Record<string, unknown>;
+	collection: string;
+}
+
+/**
  * Media hook event
  */
 export interface MediaUploadEvent {
@@ -705,6 +721,26 @@ export type ContentBeforeDeleteHandler = (
 
 export type ContentAfterDeleteHandler = (
 	event: ContentDeleteEvent,
+	ctx: PluginContext,
+) => Promise<void>;
+
+export type ContentBeforePublishHandler = (
+	event: ContentPublishEvent,
+	ctx: PluginContext,
+) => Promise<void>;
+
+export type ContentAfterPublishHandler = (
+	event: ContentAfterPublishEvent,
+	ctx: PluginContext,
+) => Promise<void>;
+
+export type ContentBeforeUnpublishHandler = (
+	event: ContentPublishEvent,
+	ctx: PluginContext,
+) => Promise<void>;
+
+export type ContentAfterUnpublishHandler = (
+	event: ContentAfterPublishEvent,
 	ctx: PluginContext,
 ) => Promise<void>;
 
@@ -857,6 +893,14 @@ export interface PluginHooks {
 	"content:afterSave"?: HookConfig<ContentAfterSaveHandler> | ContentAfterSaveHandler;
 	"content:beforeDelete"?: HookConfig<ContentBeforeDeleteHandler> | ContentBeforeDeleteHandler;
 	"content:afterDelete"?: HookConfig<ContentAfterDeleteHandler> | ContentAfterDeleteHandler;
+	"content:beforePublish"?: HookConfig<ContentBeforePublishHandler> | ContentBeforePublishHandler;
+	"content:afterPublish"?: HookConfig<ContentAfterPublishHandler> | ContentAfterPublishHandler;
+	"content:beforeUnpublish"?:
+		| HookConfig<ContentBeforeUnpublishHandler>
+		| ContentBeforeUnpublishHandler;
+	"content:afterUnpublish"?:
+		| HookConfig<ContentAfterUnpublishHandler>
+		| ContentAfterUnpublishHandler;
 
 	// Media hooks
 	"media:beforeUpload"?: HookConfig<MediaBeforeUploadHandler> | MediaBeforeUploadHandler;
@@ -1157,6 +1201,10 @@ export interface ResolvedPluginHooks {
 	"content:afterSave"?: ResolvedHook<ContentAfterSaveHandler>;
 	"content:beforeDelete"?: ResolvedHook<ContentBeforeDeleteHandler>;
 	"content:afterDelete"?: ResolvedHook<ContentAfterDeleteHandler>;
+	"content:beforePublish"?: ResolvedHook<ContentBeforePublishHandler>;
+	"content:afterPublish"?: ResolvedHook<ContentAfterPublishHandler>;
+	"content:beforeUnpublish"?: ResolvedHook<ContentBeforeUnpublishHandler>;
+	"content:afterUnpublish"?: ResolvedHook<ContentAfterUnpublishHandler>;
 	"media:beforeUpload"?: ResolvedHook<MediaBeforeUploadHandler>;
 	"media:afterUpload"?: ResolvedHook<MediaAfterUploadHandler>;
 	cron?: ResolvedHook<CronHandler>;

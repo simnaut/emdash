@@ -19,6 +19,9 @@ import {
 	requireHttp,
 } from "./atproto.js";
 import { buildBskyPost } from "./bluesky.js";
+import { bootstrap } from "./canonical/bootstrap.js";
+import { emDashToPds } from "./canonical/record-mapper.js";
+import { incrementalSync } from "./canonical/sync.js";
 import { buildPublication, buildDocument } from "./standard-site.js";
 
 // ── Types ───────────────────────────────────────────────────────
@@ -38,6 +41,13 @@ interface SyndicationRecord {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
+
+type PluginMode = "metadata" | "canonical";
+
+async function getMode(ctx: PluginContext): Promise<PluginMode> {
+	const mode = await ctx.kv.get<string>("settings:mode");
+	return mode === "canonical" ? "canonical" : "metadata";
+}
 
 async function isCollectionAllowed(ctx: PluginContext, collection: string): Promise<boolean> {
 	const setting = await ctx.kv.get<string>("settings:collections");
@@ -203,6 +213,9 @@ export default definePlugin({
 				event: { content: Record<string, unknown>; collection: string; isNew: boolean },
 				ctx: PluginContext,
 			) => {
+				// In canonical mode, publishing is handled by content:beforePublish
+				if ((await getMode(ctx)) === "canonical") return;
+
 				const { content, collection } = event;
 				const contentId = typeof content.id === "string" ? content.id : String(content.id);
 				const status = content.status as string | undefined;
@@ -262,6 +275,226 @@ export default definePlugin({
 					ctx.log.error(`Failed to delete AT Protocol records for ${collection}/${id}`, error);
 				}
 			},
+		},
+
+		// ── Canonical mode hooks ────────────────────────────────────
+
+		"content:beforePublish": {
+			handler: async (event: { id: string; collection: string }, ctx: PluginContext) => {
+				if ((await getMode(ctx)) !== "canonical") return;
+				if (!(await isCollectionAllowed(ctx, event.collection))) return;
+				if (!ctx.content) throw new Error("Canonical mode requires write:content capability");
+
+				const contentItem = await ctx.content.get(event.collection, event.id);
+				if (!contentItem) throw new Error(`Content ${event.collection}/${event.id} not found`);
+
+				const contentRecord = { ...contentItem.data, id: contentItem.id } as Record<
+					string,
+					unknown
+				>;
+				const publicationUri = await ctx.kv.get<string>("state:publicationUri");
+				if (!publicationUri) {
+					throw new Error("Publication record not created yet. Use Sync Publication first.");
+				}
+
+				const { accessJwt, did, pdsHost } = await ensureSession(ctx);
+
+				// Upload cover image if present
+				let coverImageBlob;
+				const siteUrl = await ctx.kv.get<string>("settings:siteUrl");
+				const rawCoverImage = contentRecord.cover_image as string | undefined;
+				if (rawCoverImage && siteUrl) {
+					let imageUrl = rawCoverImage;
+					if (imageUrl.startsWith("/")) imageUrl = `${siteUrl}${imageUrl}`;
+					if (imageUrl.startsWith("http://") || imageUrl.startsWith("https://")) {
+						try {
+							const http = requireHttp(ctx);
+							const imageRes = await http.fetch(imageUrl);
+							if (imageRes.ok) {
+								const bytes = await imageRes.arrayBuffer();
+								if (bytes.byteLength <= 1_000_000) {
+									const mimeType = imageRes.headers.get("content-type") || "image/jpeg";
+									coverImageBlob = await uploadBlob(ctx, pdsHost, accessJwt, bytes, mimeType);
+								}
+							}
+						} catch (error) {
+							ctx.log.warn("Failed to upload cover image, skipping", error);
+						}
+					}
+				}
+
+				// Build the PDS record using the canonical mapper
+				const doc = emDashToPds(contentRecord, event.collection, publicationUri, coverImageBlob);
+
+				// Check if we already have a PDS record for this content
+				const storageKey = `${event.collection}:${event.id}`;
+				const existing = (await ctx.storage.records!.get(storageKey)) as SyndicationRecord | null;
+
+				let result;
+				if (existing?.atUri) {
+					// Update existing PDS record
+					const rkey = rkeyFromUri(existing.atUri);
+					result = await putRecord(
+						ctx,
+						pdsHost,
+						accessJwt,
+						did,
+						"site.standard.document",
+						rkey,
+						doc,
+					);
+				} else {
+					// Create new PDS record
+					result = await createRecord(ctx, pdsHost, accessJwt, did, "site.standard.document", doc);
+				}
+
+				// Track in records storage
+				await ctx.storage.records!.put(storageKey, {
+					collection: event.collection,
+					contentId: event.id,
+					atUri: result.uri,
+					atCid: result.cid,
+					bskyPostUri: existing?.bskyPostUri,
+					bskyPostCid: existing?.bskyPostCid,
+					publishedAt: (contentRecord.published_at as string) || new Date().toISOString(),
+					lastSyncedAt: new Date().toISOString(),
+					status: "synced",
+				} satisfies SyndicationRecord);
+
+				// Track in pdsIndex for sync
+				const pdsIndex = (
+					ctx.storage as unknown as Record<
+						string,
+						{ put(key: string, data: unknown): Promise<void> } | undefined
+					>
+				).pdsIndex;
+				if (pdsIndex) {
+					const rkey = rkeyFromUri(result.uri);
+					await pdsIndex.put(rkey, {
+						rkey,
+						contentId: event.id,
+						collection: event.collection,
+						atUri: result.uri,
+						atCid: result.cid,
+						origin: "emdash",
+						importedAt: new Date().toISOString(),
+					});
+				}
+
+				ctx.log.info(
+					`PDS record ${existing?.atUri ? "updated" : "created"} for ${event.collection}/${event.id}`,
+				);
+			},
+			errorPolicy: "abort",
+		},
+
+		"content:afterPublish": {
+			handler: async (
+				event: { content: Record<string, unknown>; collection: string },
+				ctx: PluginContext,
+			) => {
+				if ((await getMode(ctx)) !== "canonical") return;
+
+				const enableCrosspost = (await ctx.kv.get<boolean>("settings:enableBskyCrosspost")) ?? true;
+				if (!enableCrosspost) return;
+
+				const storageKey = `${event.collection}:${typeof event.content.id === "string" ? event.content.id : String(event.content.id)}`;
+				const record = (await ctx.storage.records!.get(storageKey)) as SyndicationRecord | null;
+				if (!record?.atUri || record.bskyPostUri) return; // Already crossposted or no PDS record
+
+				try {
+					const siteUrl = await ctx.kv.get<string>("settings:siteUrl");
+					if (!siteUrl) return;
+
+					const { accessJwt, did, pdsHost } = await ensureSession(ctx);
+					const template =
+						(await ctx.kv.get<string>("settings:crosspostTemplate")) || "{title}\n\n{url}";
+					const langsStr = (await ctx.kv.get<string>("settings:langs")) || "en";
+					const langs = langsStr
+						.split(",")
+						.map((s) => s.trim())
+						.filter(Boolean)
+						.slice(0, 3);
+
+					const post = buildBskyPost({
+						template,
+						content: event.content,
+						siteUrl,
+						langs,
+					});
+
+					const postResult = await createRecord(
+						ctx,
+						pdsHost,
+						accessJwt,
+						did,
+						"app.bsky.feed.post",
+						post,
+					);
+
+					// Update the document with bskyPostRef
+					const publicationUri = await ctx.kv.get<string>("state:publicationUri");
+					if (publicationUri) {
+						const rkey = rkeyFromUri(record.atUri);
+						const doc = emDashToPds(event.content, event.collection, publicationUri);
+						doc.bskyPostRef = { uri: postResult.uri, cid: postResult.cid };
+						await putRecord(ctx, pdsHost, accessJwt, did, "site.standard.document", rkey, doc);
+					}
+
+					// Update storage with crosspost info
+					await ctx.storage.records!.put(storageKey, {
+						...record,
+						bskyPostUri: postResult.uri,
+						bskyPostCid: postResult.cid,
+						lastSyncedAt: new Date().toISOString(),
+					});
+
+					ctx.log.info(`Cross-posted to Bluesky for ${event.collection}`);
+				} catch (error) {
+					ctx.log.warn("Failed to cross-post to Bluesky", error);
+				}
+			},
+		},
+
+		"content:beforeUnpublish": {
+			handler: async (event: { id: string; collection: string }, ctx: PluginContext) => {
+				if ((await getMode(ctx)) !== "canonical") return;
+
+				const storageKey = `${event.collection}:${event.id}`;
+				const existing = (await ctx.storage.records!.get(storageKey)) as SyndicationRecord | null;
+				if (!existing?.atUri) return;
+
+				const { accessJwt, did, pdsHost } = await ensureSession(ctx);
+				const rkey = rkeyFromUri(existing.atUri);
+				await deleteRecord(ctx, pdsHost, accessJwt, did, "site.standard.document", rkey);
+
+				// Delete Bluesky crosspost if present
+				if (existing.bskyPostUri) {
+					try {
+						const postRkey = rkeyFromUri(existing.bskyPostUri);
+						await deleteRecord(ctx, pdsHost, accessJwt, did, "app.bsky.feed.post", postRkey);
+					} catch (error) {
+						ctx.log.warn("Failed to delete Bluesky crosspost", error);
+					}
+				}
+
+				// Clean up storage
+				await ctx.storage.records!.delete(storageKey);
+
+				// Clean up pdsIndex
+				const pdsIndex = (
+					ctx.storage as unknown as Record<
+						string,
+						{ delete(key: string): Promise<void> } | undefined
+					>
+				).pdsIndex;
+				if (pdsIndex) {
+					await pdsIndex.delete(rkey);
+				}
+
+				ctx.log.info(`Deleted PDS record for ${event.collection}/${event.id}`);
+			},
+			errorPolicy: "abort",
 		},
 
 		"page:metadata": async (
@@ -429,6 +662,68 @@ export default definePlugin({
 			},
 		},
 
+		// ── Canonical mode routes ───────────────────────────────────
+
+		bootstrap: {
+			handler: async (_routeCtx: unknown, ctx: PluginContext) => {
+				if ((await getMode(ctx)) !== "canonical") {
+					return { success: false, error: "Bootstrap is only available in canonical mode" };
+				}
+
+				try {
+					const importCollections = await ctx.kv.get<string>("settings:importCollections");
+					const additionalCollections = importCollections
+						? importCollections
+								.split(",")
+								.map((s) => s.trim())
+								.filter(Boolean)
+						: undefined;
+
+					const result = await bootstrap(ctx, {
+						additionalCollections,
+					});
+
+					return { success: true, ...result };
+				} catch (error) {
+					ctx.log.error("Bootstrap failed", error);
+					return {
+						success: false,
+						error: error instanceof Error ? error.message : String(error),
+					};
+				}
+			},
+		},
+
+		sync: {
+			handler: async (_routeCtx: unknown, ctx: PluginContext) => {
+				if ((await getMode(ctx)) !== "canonical") {
+					return { success: false, error: "Sync is only available in canonical mode" };
+				}
+
+				try {
+					const importCollections = await ctx.kv.get<string>("settings:importCollections");
+					const additionalCollections = importCollections
+						? importCollections
+								.split(",")
+								.map((s) => s.trim())
+								.filter(Boolean)
+						: undefined;
+
+					const result = await incrementalSync(ctx, {
+						additionalCollections,
+					});
+
+					return { success: true, ...result };
+				} catch (error) {
+					ctx.log.error("Sync failed", error);
+					return {
+						success: false,
+						error: error instanceof Error ? error.message : String(error),
+					};
+				}
+			},
+		},
+
 		admin: {
 			handler: async (routeCtx: any, ctx: PluginContext) => {
 				const interaction = routeCtx.input as {
@@ -449,6 +744,12 @@ export default definePlugin({
 				}
 				if (interaction.type === "block_action" && interaction.action_id === "test_connection") {
 					return testConnection(ctx);
+				}
+				if (interaction.type === "block_action" && interaction.action_id === "run_bootstrap") {
+					return runBootstrap(ctx);
+				}
+				if (interaction.type === "block_action" && interaction.action_id === "run_sync") {
+					return runSync(ctx);
 				}
 				return { blocks: [] };
 			},
@@ -499,6 +800,8 @@ async function buildStatusPage(ctx: PluginContext) {
 		const pdsHost = await ctx.kv.get<string>("settings:pdsHost");
 		const siteUrl = await ctx.kv.get<string>("settings:siteUrl");
 		const enableCrosspost = await ctx.kv.get<boolean>("settings:enableCrosspost");
+		const mode = await getMode(ctx);
+		const importCollections = await ctx.kv.get<string>("settings:importCollections");
 		const did = await ctx.kv.get<string>("state:did");
 		const pubUri = await ctx.kv.get<string>("state:publicationUri");
 
@@ -549,11 +852,38 @@ async function buildStatusPage(ctx: PluginContext) {
 					initial_value: siteUrl ?? "",
 				},
 				{
+					type: "select",
+					action_id: "mode",
+					label: "Mode",
+					initial_value: mode,
+					options: [
+						{
+							label: "Metadata — create standard.site records on publish (one-way)",
+							value: "metadata",
+						},
+						{
+							label: "Canonical — PDS is source of truth, EmDash is a cache",
+							value: "canonical",
+						},
+					],
+				},
+				{
 					type: "toggle",
 					action_id: "enableCrosspost",
 					label: "Cross-post to Bluesky",
 					initial_value: enableCrosspost ?? false,
 				},
+				...(mode === "canonical"
+					? [
+							{
+								type: "text_input",
+								action_id: "importCollections",
+								label: "Additional PDS Collections (comma-separated)",
+								initial_value: importCollections ?? "",
+								placeholder: "com.whtwnd.blog.entry",
+							},
+						]
+					: []),
 			],
 			submit: { label: "Save Settings", action_id: "save_settings" },
 		});
@@ -569,6 +899,50 @@ async function buildStatusPage(ctx: PluginContext) {
 				},
 			],
 		});
+
+		// Canonical mode controls
+		if (mode === "canonical" && did) {
+			const lastSync = await ctx.kv.get<string>("canonical:lastSync");
+			const lastBootstrap = await ctx.kv.get<string>("canonical:lastBootstrap");
+			const recordCount = await ctx.kv.get<string>("canonical:recordCount");
+
+			blocks.push(
+				{ type: "divider" },
+				{ type: "header", text: "PDS Canonical Mode" },
+				{
+					type: "section",
+					text: "PDS is the source of truth. Content is loaded from PDS records. Publishes write to PDS first.",
+				},
+			);
+
+			if (lastBootstrap || lastSync) {
+				blocks.push({
+					type: "fields",
+					fields: [
+						...(lastBootstrap ? [{ label: "Last Bootstrap", value: lastBootstrap }] : []),
+						...(lastSync ? [{ label: "Last Sync", value: lastSync }] : []),
+						...(recordCount ? [{ label: "PDS Records", value: recordCount }] : []),
+					],
+				});
+			}
+
+			blocks.push({
+				type: "actions",
+				elements: [
+					{
+						type: "button",
+						text: "Sync from PDS",
+						action_id: "run_bootstrap",
+						style: "primary",
+					},
+					{
+						type: "button",
+						text: "Incremental Sync",
+						action_id: "run_sync",
+					},
+				],
+			});
+		}
 
 		if (did) {
 			const result = await ctx.storage.records!.query({
@@ -636,8 +1010,15 @@ async function saveSettings(ctx: PluginContext, values: Record<string, unknown>)
 			await ctx.kv.set("settings:appPassword", values.appPassword);
 		if (typeof values.pdsHost === "string") await ctx.kv.set("settings:pdsHost", values.pdsHost);
 		if (typeof values.siteUrl === "string") await ctx.kv.set("settings:siteUrl", values.siteUrl);
+		if (
+			typeof values.mode === "string" &&
+			(values.mode === "metadata" || values.mode === "canonical")
+		)
+			await ctx.kv.set("settings:mode", values.mode);
 		if (typeof values.enableCrosspost === "boolean")
 			await ctx.kv.set("settings:enableCrosspost", values.enableCrosspost);
+		if (typeof values.importCollections === "string")
+			await ctx.kv.set("settings:importCollections", values.importCollections);
 
 		const page = await buildStatusPage(ctx);
 		return { ...page, toast: { message: "Settings saved", type: "success" } };
@@ -664,6 +1045,68 @@ async function testConnection(ctx: PluginContext) {
 			...page,
 			toast: {
 				message: `Connection failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+				type: "error",
+			},
+		};
+	}
+}
+
+async function runBootstrap(ctx: PluginContext) {
+	try {
+		const importCollections = await ctx.kv.get<string>("settings:importCollections");
+		const additionalCollections = importCollections
+			? importCollections
+					.split(",")
+					.map((s) => s.trim())
+					.filter(Boolean)
+			: undefined;
+
+		const result = await bootstrap(ctx, { additionalCollections });
+		const page = await buildStatusPage(ctx);
+		return {
+			...page,
+			toast: {
+				message: `Bootstrap complete: ${result.imported} imported, ${result.skipped} skipped, ${result.errors} errors`,
+				type: result.errors > 0 ? "warning" : "success",
+			},
+		};
+	} catch (error) {
+		const page = await buildStatusPage(ctx);
+		return {
+			...page,
+			toast: {
+				message: `Bootstrap failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+				type: "error",
+			},
+		};
+	}
+}
+
+async function runSync(ctx: PluginContext) {
+	try {
+		const importCollections = await ctx.kv.get<string>("settings:importCollections");
+		const additionalCollections = importCollections
+			? importCollections
+					.split(",")
+					.map((s) => s.trim())
+					.filter(Boolean)
+			: undefined;
+
+		const result = await incrementalSync(ctx, { additionalCollections });
+		const page = await buildStatusPage(ctx);
+		return {
+			...page,
+			toast: {
+				message: `Sync complete: +${result.created} ~${result.updated} -${result.deleted} =${result.unchanged}`,
+				type: result.errors > 0 ? "warning" : "success",
+			},
+		};
+	} catch (error) {
+		const page = await buildStatusPage(ctx);
+		return {
+			...page,
+			toast: {
+				message: `Sync failed: ${error instanceof Error ? error.message : "Unknown error"}`,
 				type: "error",
 			},
 		};

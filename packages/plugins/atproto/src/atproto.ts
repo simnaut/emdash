@@ -392,6 +392,114 @@ export async function uploadBlob(
 	return data.blob as BlobRef;
 }
 
+// ── Record listing & retrieval ──────────────────────────────────
+
+export interface ListRecordsResponse {
+	records: Array<{ uri: string; cid: string; value: unknown }>;
+	cursor?: string;
+}
+
+/**
+ * List records in a collection on the PDS.
+ * Supports cursor-based pagination.
+ */
+export async function listRecords(
+	ctx: PluginContext,
+	pdsHost: string,
+	accessJwt: string,
+	did: string,
+	collection: string,
+	opts?: { limit?: number; cursor?: string; reverse?: boolean },
+): Promise<ListRecordsResponse> {
+	const http = requireHttp(ctx);
+	const params = new URLSearchParams({
+		repo: did,
+		collection,
+	});
+	if (opts?.limit) params.set("limit", String(opts.limit));
+	if (opts?.cursor) params.set("cursor", opts.cursor);
+	if (opts?.reverse) params.set("reverse", "true");
+
+	let res = await http.fetch(
+		`https://${pdsHost}/xrpc/com.atproto.repo.listRecords?${params.toString()}`,
+		{
+			headers: { Authorization: `Bearer ${accessJwt}` },
+		},
+	);
+
+	if (res.status === 401) {
+		const refreshed = await ensureSessionFresh(ctx, pdsHost);
+		if (refreshed) {
+			res = await http.fetch(
+				`https://${pdsHost}/xrpc/com.atproto.repo.listRecords?${params.toString()}`,
+				{
+					headers: { Authorization: `Bearer ${refreshed.accessJwt}` },
+				},
+			);
+		}
+	}
+
+	if (!res.ok) {
+		const body = await res.text().catch(() => "");
+		throw new Error(`listRecords failed (${res.status}): ${body}`);
+	}
+
+	const data = (await res.json()) as Record<string, unknown>;
+	const records = Array.isArray(data.records) ? data.records : [];
+	const cursor = typeof data.cursor === "string" ? data.cursor : undefined;
+
+	return {
+		records: records as Array<{ uri: string; cid: string; value: unknown }>,
+		cursor,
+	};
+}
+
+/**
+ * Get a single record from the PDS by rkey.
+ */
+export async function getRecord(
+	ctx: PluginContext,
+	pdsHost: string,
+	accessJwt: string,
+	did: string,
+	collection: string,
+	rkey: string,
+): Promise<{ uri: string; cid: string; value: unknown }> {
+	const http = requireHttp(ctx);
+	const params = new URLSearchParams({ repo: did, collection, rkey });
+
+	let res = await http.fetch(
+		`https://${pdsHost}/xrpc/com.atproto.repo.getRecord?${params.toString()}`,
+		{
+			headers: { Authorization: `Bearer ${accessJwt}` },
+		},
+	);
+
+	if (res.status === 401) {
+		const refreshed = await ensureSessionFresh(ctx, pdsHost);
+		if (refreshed) {
+			res = await http.fetch(
+				`https://${pdsHost}/xrpc/com.atproto.repo.getRecord?${params.toString()}`,
+				{
+					headers: { Authorization: `Bearer ${refreshed.accessJwt}` },
+				},
+			);
+		}
+	}
+
+	if (!res.ok) {
+		const body = await res.text().catch(() => "");
+		throw new Error(`getRecord failed (${res.status}): ${body}`);
+	}
+
+	const data = (await res.json()) as Record<string, unknown>;
+	return {
+		uri: requireString(data, "uri", "getRecord"),
+		cid: requireString(data, "cid", "getRecord"),
+		value: data.value,
+	};
+}
+
 // ── Utilities ───────────────────────────────────────────────────
 
 /**

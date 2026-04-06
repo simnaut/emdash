@@ -17,6 +17,8 @@ import type {
 	PluginContext,
 	ContentHookEvent,
 	ContentDeleteEvent,
+	ContentPublishEvent,
+	ContentAfterPublishEvent,
 	MediaUploadEvent,
 	MediaAfterUploadEvent,
 	LifecycleEvent,
@@ -30,6 +32,10 @@ import type {
 	ContentAfterSaveHandler,
 	ContentBeforeDeleteHandler,
 	ContentAfterDeleteHandler,
+	ContentBeforePublishHandler,
+	ContentAfterPublishHandler,
+	ContentBeforeUnpublishHandler,
+	ContentAfterUnpublishHandler,
 	MediaBeforeUploadHandler,
 	MediaAfterUploadHandler,
 	LifecycleHandler,
@@ -61,6 +67,10 @@ type HookNameV2 =
 	| "content:afterSave"
 	| "content:beforeDelete"
 	| "content:afterDelete"
+	| "content:beforePublish"
+	| "content:afterPublish"
+	| "content:beforeUnpublish"
+	| "content:afterUnpublish"
 	| "media:beforeUpload"
 	| "media:afterUpload"
 	| "cron"
@@ -86,6 +96,10 @@ interface HookHandlerMap {
 	"content:afterSave": ContentAfterSaveHandler;
 	"content:beforeDelete": ContentBeforeDeleteHandler;
 	"content:afterDelete": ContentAfterDeleteHandler;
+	"content:beforePublish": ContentBeforePublishHandler;
+	"content:afterPublish": ContentAfterPublishHandler;
+	"content:beforeUnpublish": ContentBeforeUnpublishHandler;
+	"content:afterUnpublish": ContentAfterUnpublishHandler;
 	"media:beforeUpload": MediaBeforeUploadHandler;
 	"media:afterUpload": MediaAfterUploadHandler;
 	cron: CronHandler;
@@ -593,6 +607,166 @@ export class HookPipeline {
 		for (const hook of hooks) {
 			const { handler } = hook;
 			const event: ContentDeleteEvent = { id, collection };
+			const ctx = this.getContext(hook.pluginId);
+			const start = Date.now();
+
+			try {
+				await this.executeWithTimeout(() => handler(event, ctx), hook.timeout);
+				results.push({
+					success: true,
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+			} catch (error) {
+				results.push({
+					success: false,
+					error: error instanceof Error ? error : new Error(String(error)),
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+
+				if (hook.errorPolicy === "abort") {
+					throw error;
+				}
+			}
+		}
+
+		return results;
+	}
+
+	// =========================================================================
+	// Publish/Unpublish Hooks
+	// =========================================================================
+
+	/**
+	 * Run content:beforePublish hooks.
+	 * Can block publication by throwing (with errorPolicy: "abort").
+	 */
+	async runContentBeforePublish(id: string, collection: string): Promise<HookResult<void>[]> {
+		const hooks = this.getTypedHooks("content:beforePublish");
+		const results: HookResult<void>[] = [];
+
+		for (const hook of hooks) {
+			const { handler } = hook;
+			const event: ContentPublishEvent = { id, collection };
+			const ctx = this.getContext(hook.pluginId);
+			const start = Date.now();
+
+			try {
+				await this.executeWithTimeout(() => handler(event, ctx), hook.timeout);
+				results.push({
+					success: true,
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+			} catch (error) {
+				results.push({
+					success: false,
+					error: error instanceof Error ? error : new Error(String(error)),
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+
+				if (hook.errorPolicy === "abort") {
+					throw error;
+				}
+			}
+		}
+
+		return results;
+	}
+
+	/**
+	 * Run content:afterPublish hooks (fire-and-forget).
+	 */
+	async runContentAfterPublish(
+		content: Record<string, unknown>,
+		collection: string,
+	): Promise<HookResult<void>[]> {
+		const hooks = this.getTypedHooks("content:afterPublish");
+		const results: HookResult<void>[] = [];
+
+		for (const hook of hooks) {
+			const { handler } = hook;
+			const event: ContentAfterPublishEvent = { content, collection };
+			const ctx = this.getContext(hook.pluginId);
+			const start = Date.now();
+
+			try {
+				await this.executeWithTimeout(() => handler(event, ctx), hook.timeout);
+				results.push({
+					success: true,
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+			} catch (error) {
+				results.push({
+					success: false,
+					error: error instanceof Error ? error : new Error(String(error)),
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+
+				if (hook.errorPolicy === "abort") {
+					throw error;
+				}
+			}
+		}
+
+		return results;
+	}
+
+	/**
+	 * Run content:beforeUnpublish hooks.
+	 * Can block unpublication by throwing (with errorPolicy: "abort").
+	 */
+	async runContentBeforeUnpublish(id: string, collection: string): Promise<HookResult<void>[]> {
+		const hooks = this.getTypedHooks("content:beforeUnpublish");
+		const results: HookResult<void>[] = [];
+
+		for (const hook of hooks) {
+			const { handler } = hook;
+			const event: ContentPublishEvent = { id, collection };
+			const ctx = this.getContext(hook.pluginId);
+			const start = Date.now();
+
+			try {
+				await this.executeWithTimeout(() => handler(event, ctx), hook.timeout);
+				results.push({
+					success: true,
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+			} catch (error) {
+				results.push({
+					success: false,
+					error: error instanceof Error ? error : new Error(String(error)),
+					pluginId: hook.pluginId,
+					duration: Date.now() - start,
+				});
+
+				if (hook.errorPolicy === "abort") {
+					throw error;
+				}
+			}
+		}
+
+		return results;
+	}
+
+	/**
+	 * Run content:afterUnpublish hooks (fire-and-forget).
+	 */
+	async runContentAfterUnpublish(
+		content: Record<string, unknown>,
+		collection: string,
+	): Promise<HookResult<void>[]> {
+		const hooks = this.getTypedHooks("content:afterUnpublish");
+		const results: HookResult<void>[] = [];
+
+		for (const hook of hooks) {
+			const { handler } = hook;
+			const event: ContentAfterPublishEvent = { content, collection };
 			const ctx = this.getContext(hook.pluginId);
 			const start = Date.now();
 

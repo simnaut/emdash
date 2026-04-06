@@ -27,6 +27,8 @@ export interface StandardDocument {
 	tags?: string[];
 	updatedAt?: string;
 	coverImage?: BlobRefLike;
+	/** Open union content field — supports cms.emdash.portableText and other formats */
+	content?: Record<string, unknown>;
 	/** Strong reference to a Bluesky post for off-platform comments */
 	bskyPostRef?: { uri: string; cid: string };
 }
